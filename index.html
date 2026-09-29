@@ -1,0 +1,545 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Asteroids-lite</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { font-family: ui-monospace, Menlo, Consolas, monospace; color: #fff; }
+  canvas { display: block; }
+
+  /* On-screen buttons: only shown on touch devices. */
+  #touch {
+    position: fixed; left: 0; right: 0; bottom: 0;
+    display: none; justify-content: space-between;
+    padding: 16px; pointer-events: none;
+  }
+  #touch .group { display: flex; gap: 12px; }
+  #touch button {
+    pointer-events: auto;
+    touch-action: none;           /* stops scrolling/zooming only while pressing a button */
+    user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+    width: 76px; height: 76px; border-radius: 50%;
+    border: 2px solid rgba(255, 255, 255, 0.6);
+    background: rgba(255, 255, 255, 0.08);
+    color: #fff; font: inherit; font-size: 13px;
+  }
+  #touch button.held { background: rgba(255, 255, 255, 0.35); }
+  @media (hover: none) and (pointer: coarse) { #touch { display: flex; } }
+
+  #pause {
+    position: fixed; top: 12px; left: 50%; transform: translateX(-50%);
+    padding: 6px 16px; border-radius: 6px;
+    border: 1px solid rgba(255, 255, 255, 0.6);
+    background: rgba(255, 255, 255, 0.08);
+    color: #fff; font: inherit; font-size: 14px; cursor: pointer;
+    touch-action: manipulation;
+  }
+  #pause[hidden] { display: none; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<button id="pause" hidden>Pause (P)</button>
+
+<div id="touch">
+  <div class="group">
+    <button data-action="left">◀ Left</button>
+    <button data-action="right">Right ▶</button>
+  </div>
+  <div class="group">
+    <button data-action="thrust">Thrust</button>
+    <button data-action="fire">Fire</button>
+  </div>
+</div>
+
+<script>
+// ---------- Settings ----------
+const HIGH_SCORE_KEY = 'asteroidsHighScore';
+const START_LIVES = 3;
+const RESPAWN_SAFE_TIME = 2;      // seconds the ship can't be hit after (re)spawning
+const WAVE_PAUSE = 1.5;           // seconds between clearing a wave and the next one
+
+const SHIP_RADIUS = 12;
+const TURN_SPEED = 4;             // radians per second
+const THRUST = 320;               // pixels per second squared
+const DRAG = 0.5;                 // how fast momentum fades (higher = faster)
+const MAX_SPEED = 420;
+
+const BULLET_SPEED = 520;
+const BULLET_LIFE = 0.9;          // seconds
+const FIRE_COOLDOWN = 0.2;        // seconds between shots while holding fire
+const MAX_BULLETS = 6;
+
+// size 3 = large, 2 = medium, 1 = small
+const ROCK_SIZES = {
+  3: { radius: 48, points: 20,  speed: 40 },
+  2: { radius: 26, points: 50,  speed: 70 },
+  1: { radius: 14, points: 100, speed: 100 },
+};
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const isTouchDevice = window.matchMedia('(hover: none) and (pointer: coarse)').matches;
+
+// ---------- Game state ----------
+let width = 0, height = 0;
+let state = 'title';              // 'title' | 'playing' | 'paused' | 'gameover'
+let ship, rocks = [], bullets = [], particles = [];
+let score = 0, lives = 0, wave = 0;
+let waveTimer = null;             // counts down to the next wave once all rocks are gone
+let gameOverAt = 0;
+let newHighScore = false;
+let highScore = loadHighScore();
+
+// ---------- High score (browser local storage) ----------
+function loadHighScore() {
+  const saved = Number(localStorage.getItem(HIGH_SCORE_KEY));
+  return Number.isFinite(saved) ? saved : 0;
+}
+
+function saveHighScore() {
+  if (score > highScore) {
+    highScore = score;
+    newHighScore = true;
+    localStorage.setItem(HIGH_SCORE_KEY, String(highScore));
+  }
+}
+
+// ---------- Screen size ----------
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  width = window.innerWidth;
+  height = window.innerHeight;
+  canvas.width = width * dpr;
+  canvas.height = height * dpr;
+  canvas.style.width = width + 'px';
+  canvas.style.height = height + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ---------- Input ----------
+const input = { left: false, right: false, thrust: false, fire: false };
+const KEY_ACTIONS = {
+  ArrowLeft: 'left', KeyA: 'left',
+  ArrowRight: 'right', KeyD: 'right',
+  ArrowUp: 'thrust', KeyW: 'thrust',
+  Space: 'fire',
+};
+
+const onStartScreen = () => state === 'title' || state === 'gameover';
+
+window.addEventListener('keydown', (e) => {
+  if ((e.code === 'KeyP' || e.code === 'Escape') && !e.repeat) {
+    togglePause();
+    return;
+  }
+  if (onStartScreen() && (e.code === 'Enter' || e.code === 'Space')) {
+    e.preventDefault();
+    if (!e.repeat) tryStart();
+    return;
+  }
+  const action = KEY_ACTIONS[e.code];
+  if (action) {
+    input[action] = true;
+    e.preventDefault();
+  }
+});
+
+window.addEventListener('keyup', (e) => {
+  const action = KEY_ACTIONS[e.code];
+  if (action) input[action] = false;
+});
+
+// Switching tabs or windows releases all keys and pauses the game.
+window.addEventListener('blur', () => {
+  for (const action in input) input[action] = false;
+  if (state === 'playing') togglePause();
+});
+
+canvas.addEventListener('pointerdown', () => {
+  if (onStartScreen()) tryStart();
+  else if (state === 'paused') togglePause();
+});
+
+const pauseButton = document.getElementById('pause');
+pauseButton.addEventListener('click', () => {
+  togglePause();
+  pauseButton.blur();             // so Space fires instead of pressing this button again
+});
+
+// Each button tracks its own finger, so several can be held at once.
+document.querySelectorAll('#touch button').forEach((button) => {
+  const action = button.dataset.action;
+  const press = (e) => {
+    e.preventDefault();
+    button.setPointerCapture(e.pointerId);
+    input[action] = true;
+    button.classList.add('held');
+    if (action === 'fire' && onStartScreen()) tryStart();
+  };
+  const release = () => {
+    input[action] = false;
+    button.classList.remove('held');
+  };
+  button.addEventListener('pointerdown', press);
+  button.addEventListener('pointerup', release);
+  button.addEventListener('pointercancel', release);
+  button.addEventListener('lostpointercapture', release);
+  button.addEventListener('contextmenu', (e) => e.preventDefault());
+});
+
+// ---------- Starting, pausing, waves, lives ----------
+function togglePause() {
+  if (state === 'playing') state = 'paused';
+  else if (state === 'paused') state = 'playing';
+}
+
+function tryStart() {
+  // Short pause after game over so a held key doesn't instantly restart.
+  if (state === 'gameover' && performance.now() - gameOverAt < 800) return;
+  startGame();
+}
+
+function startGame() {
+  score = 0;
+  lives = START_LIVES;
+  wave = 0;
+  rocks = [];
+  bullets = [];
+  particles = [];
+  waveTimer = null;
+  newHighScore = false;
+  ship = newShip();
+  state = 'playing';
+  nextWave();
+}
+
+function newShip() {
+  return {
+    x: width / 2, y: height / 2,
+    vx: 0, vy: 0,
+    angle: -Math.PI / 2,          // pointing up
+    safeTime: RESPAWN_SAFE_TIME,
+    fireTimer: 0,
+  };
+}
+
+function nextWave() {
+  wave++;
+  for (let i = 0; i < wave + 3; i++) {
+    // Place large rocks away from the ship so a wave never starts with a hit.
+    let x, y;
+    do {
+      x = Math.random() * width;
+      y = Math.random() * height;
+    } while (Math.hypot(x - ship.x, y - ship.y) < 180);
+    rocks.push(makeRock(3, x, y));
+  }
+}
+
+function makeRock(size, x, y) {
+  const { radius, speed } = ROCK_SIZES[size];
+  const direction = Math.random() * Math.PI * 2;
+  const velocity = speed * (0.6 + Math.random() * 0.8) * (1 + (wave - 1) * 0.05);
+  // A jagged outline: 10 points at slightly random distances from the center.
+  const shape = Array.from({ length: 10 }, () => 0.75 + Math.random() * 0.4);
+  return {
+    size, radius, x, y, shape,
+    vx: Math.cos(direction) * velocity,
+    vy: Math.sin(direction) * velocity,
+    angle: 0,
+    spin: (Math.random() - 0.5) * 1.5,
+  };
+}
+
+function hitRock(rock) {
+  score += ROCK_SIZES[rock.size].points;
+  explode(rock.x, rock.y, 8);
+  rocks.splice(rocks.indexOf(rock), 1);
+  if (rock.size > 1) {
+    rocks.push(makeRock(rock.size - 1, rock.x, rock.y));
+    rocks.push(makeRock(rock.size - 1, rock.x, rock.y));
+  }
+}
+
+function loseLife() {
+  explode(ship.x, ship.y, 20);
+  lives--;
+  if (lives <= 0) {
+    state = 'gameover';
+    gameOverAt = performance.now();
+    saveHighScore();
+  } else {
+    ship = newShip();             // respawn in the center, briefly safe
+  }
+}
+
+function explode(x, y, count) {
+  for (let i = 0; i < count; i++) {
+    const direction = Math.random() * Math.PI * 2;
+    const speed = 40 + Math.random() * 120;
+    particles.push({
+      x, y,
+      vx: Math.cos(direction) * speed,
+      vy: Math.sin(direction) * speed,
+      life: 0.4 + Math.random() * 0.4,
+    });
+  }
+}
+
+// ---------- Update ----------
+function wrap(obj, margin) {
+  if (obj.x < -margin) obj.x = width + margin;
+  if (obj.x > width + margin) obj.x = -margin;
+  if (obj.y < -margin) obj.y = height + margin;
+  if (obj.y > height + margin) obj.y = -margin;
+}
+
+function update(dt) {
+  if (state === 'paused') return;   // freeze everything
+
+  for (const rock of rocks) {
+    rock.x += rock.vx * dt;
+    rock.y += rock.vy * dt;
+    rock.angle += rock.spin * dt;
+    wrap(rock, rock.radius);
+  }
+
+  for (const p of particles) {
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.life -= dt;
+  }
+  particles = particles.filter((p) => p.life > 0);
+
+  if (state !== 'playing') return;
+
+  updateShip(dt);
+  updateBullets(dt);
+  checkCollisions();
+
+  if (rocks.length === 0) {
+    if (waveTimer === null) waveTimer = WAVE_PAUSE;
+    waveTimer -= dt;
+    if (waveTimer <= 0) {
+      waveTimer = null;
+      nextWave();
+    }
+  }
+}
+
+function updateShip(dt) {
+  if (input.left) ship.angle -= TURN_SPEED * dt;
+  if (input.right) ship.angle += TURN_SPEED * dt;
+
+  if (input.thrust) {
+    ship.vx += Math.cos(ship.angle) * THRUST * dt;
+    ship.vy += Math.sin(ship.angle) * THRUST * dt;
+  }
+
+  // Momentum fades slowly; speed is capped.
+  const fade = Math.exp(-DRAG * dt);
+  ship.vx *= fade;
+  ship.vy *= fade;
+  const speed = Math.hypot(ship.vx, ship.vy);
+  if (speed > MAX_SPEED) {
+    ship.vx *= MAX_SPEED / speed;
+    ship.vy *= MAX_SPEED / speed;
+  }
+
+  ship.x += ship.vx * dt;
+  ship.y += ship.vy * dt;
+  wrap(ship, SHIP_RADIUS);
+
+  ship.safeTime = Math.max(0, ship.safeTime - dt);
+  ship.fireTimer -= dt;
+  if (input.fire && ship.fireTimer <= 0 && bullets.length < MAX_BULLETS) {
+    fireBullet();
+    ship.fireTimer = FIRE_COOLDOWN;
+  }
+}
+
+function fireBullet() {
+  const dx = Math.cos(ship.angle), dy = Math.sin(ship.angle);
+  bullets.push({
+    x: ship.x + dx * SHIP_RADIUS,
+    y: ship.y + dy * SHIP_RADIUS,
+    vx: ship.vx + dx * BULLET_SPEED,
+    vy: ship.vy + dy * BULLET_SPEED,
+    life: BULLET_LIFE,
+  });
+}
+
+function updateBullets(dt) {
+  for (const b of bullets) {
+    b.x += b.vx * dt;
+    b.y += b.vy * dt;
+    b.life -= dt;
+    wrap(b, 0);
+  }
+  bullets = bullets.filter((b) => b.life > 0);
+}
+
+function checkCollisions() {
+  for (const bullet of [...bullets]) {
+    const rock = rocks.find((r) => Math.hypot(r.x - bullet.x, r.y - bullet.y) < r.radius);
+    if (rock) {
+      bullets.splice(bullets.indexOf(bullet), 1);
+      hitRock(rock);
+    }
+  }
+
+  if (ship.safeTime > 0) return;
+  const hit = rocks.some((r) => Math.hypot(r.x - ship.x, r.y - ship.y) < r.radius + SHIP_RADIUS * 0.8);
+  if (hit) loseLife();
+}
+
+// ---------- Drawing ----------
+function draw() {
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, width, height);
+  ctx.strokeStyle = '#fff';
+  ctx.fillStyle = '#fff';
+  ctx.lineWidth = 1.5;
+
+  rocks.forEach(drawRock);
+  for (const b of bullets) ctx.fillRect(b.x - 1.5, b.y - 1.5, 3, 3);
+  for (const p of particles) {
+    ctx.globalAlpha = Math.min(1, p.life * 2);
+    ctx.fillRect(p.x - 1, p.y - 1, 2, 2);
+  }
+  ctx.globalAlpha = 1;
+
+  if (state === 'playing' || state === 'paused') {
+    // Blink while the ship can't be hit.
+    const visible = ship.safeTime === 0 || Math.floor(ship.safeTime * 8) % 2 === 0;
+    if (visible) drawShip(ship.x, ship.y, ship.angle, state === 'playing' && input.thrust);
+    drawHud();
+    if (waveTimer !== null) centerText(`WAVE ${wave + 1}`, height / 2 - 60, 28);
+    if (state === 'paused') drawPausedScreen();
+  } else if (state === 'title') {
+    drawTitleScreen();
+  } else {
+    drawHud();
+    drawGameOverScreen();
+  }
+}
+
+function drawShip(x, y, angle, thrusting) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(angle);
+  ctx.beginPath();
+  ctx.moveTo(SHIP_RADIUS, 0);
+  ctx.lineTo(-SHIP_RADIUS, -SHIP_RADIUS * 0.7);
+  ctx.lineTo(-SHIP_RADIUS * 0.6, 0);
+  ctx.lineTo(-SHIP_RADIUS, SHIP_RADIUS * 0.7);
+  ctx.closePath();
+  ctx.stroke();
+  if (thrusting && Math.random() > 0.3) {
+    ctx.beginPath();
+    ctx.moveTo(-SHIP_RADIUS * 0.7, -SHIP_RADIUS * 0.35);
+    ctx.lineTo(-SHIP_RADIUS * 1.6, 0);
+    ctx.lineTo(-SHIP_RADIUS * 0.7, SHIP_RADIUS * 0.35);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawRock(rock) {
+  ctx.save();
+  ctx.translate(rock.x, rock.y);
+  ctx.rotate(rock.angle);
+  ctx.beginPath();
+  rock.shape.forEach((scale, i) => {
+    const a = (i / rock.shape.length) * Math.PI * 2;
+    const r = rock.radius * scale;
+    if (i === 0) ctx.moveTo(Math.cos(a) * r, Math.sin(a) * r);
+    else ctx.lineTo(Math.cos(a) * r, Math.sin(a) * r);
+  });
+  ctx.closePath();
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawHud() {
+  ctx.font = '18px ui-monospace, Menlo, Consolas, monospace';
+  ctx.textBaseline = 'top';
+  ctx.textAlign = 'left';
+  ctx.fillText(`SCORE ${score}`, 16, 16);
+  ctx.fillText(`WAVE ${wave}`, 16, 42);
+  ctx.textAlign = 'right';
+  ctx.fillText(`HIGH ${highScore}`, width - 16, 16);
+  ctx.fillText(`LIVES ${lives}`, width - 16, 42);
+  // Small ship icons for remaining lives.
+  for (let i = 0; i < lives; i++) drawShip(width - 24 - i * 22, 82, -Math.PI / 2, false);
+
+  if (!isTouchDevice) {
+    ctx.fillStyle = '#888';
+    centerText('← → / A D rotate   ↑ / W thrust   Space fire', height - 28, 14);
+    ctx.fillStyle = '#fff';
+  }
+}
+
+function drawTitleScreen() {
+  centerText('ASTEROIDS-LITE', height / 2 - 110, 40);
+  centerText(`High score: ${highScore}`, height / 2 - 60, 18);
+  controlInstructions(height / 2 - 10);
+  centerText(isTouchDevice ? 'Tap to start' : 'Press Enter or click to start', height / 2 + 100, 20);
+}
+
+function drawGameOverScreen() {
+  centerText('GAME OVER', height / 2 - 110, 40);
+  centerText(`Score: ${score}`, height / 2 - 60, 20);
+  if (newHighScore) centerText('New high score!', height / 2 - 32, 18);
+  controlInstructions(height / 2 + 10);
+  centerText(isTouchDevice ? 'Tap to play again' : 'Press Enter or click to play again', height / 2 + 120, 20);
+}
+
+function drawPausedScreen() {
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
+  ctx.fillRect(0, 0, width, height);
+  ctx.fillStyle = '#fff';
+  centerText('PAUSED', height / 2 - 20, 40);
+  centerText(isTouchDevice ? 'Tap to resume' : 'Press P, Esc or click to resume', height / 2 + 30, 18);
+}
+
+function controlInstructions(y) {
+  ctx.fillStyle = '#aaa';
+  if (isTouchDevice) {
+    centerText('Hold the buttons below: Left, Right,', y, 15);
+    centerText('Thrust and Fire (hold several at once)', y + 22, 15);
+  } else {
+    centerText('← → or A D   rotate', y, 15);
+    centerText('↑ or W       thrust', y + 22, 15);
+    centerText('Space        fire  ', y + 44, 15);
+  }
+  ctx.fillStyle = '#fff';
+}
+
+function centerText(text, y, size) {
+  ctx.font = `${size}px ui-monospace, Menlo, Consolas, monospace`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, width / 2, y);
+}
+
+// ---------- Main loop ----------
+let lastTime = performance.now();
+function frame(now) {
+  const dt = Math.min((now - lastTime) / 1000, 0.05);   // cap so a background tab doesn't jump
+  lastTime = now;
+  update(dt);
+  draw();
+  pauseButton.hidden = onStartScreen();
+  pauseButton.textContent = state === 'paused' ? 'Resume (P)' : 'Pause (P)';
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
