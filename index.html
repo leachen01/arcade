@@ -28,20 +28,26 @@
   #touch button.held { background: rgba(255, 255, 255, 0.35); }
   @media (hover: none) and (pointer: coarse) { #touch { display: flex; } }
 
-  #pause {
+  #topbar {
     position: fixed; top: 12px; left: 50%; transform: translateX(-50%);
+    display: flex; gap: 8px;
+  }
+  #topbar button {
     padding: 6px 16px; border-radius: 6px;
     border: 1px solid rgba(255, 255, 255, 0.6);
     background: rgba(255, 255, 255, 0.08);
     color: #fff; font: inherit; font-size: 14px; cursor: pointer;
     touch-action: manipulation;
   }
-  #pause[hidden] { display: none; }
+  #topbar button[hidden] { display: none; }
 </style>
 </head>
 <body>
 <canvas id="game"></canvas>
-<button id="pause" hidden>Pause (P)</button>
+<div id="topbar">
+  <button id="pause" hidden>Pause (P)</button>
+  <button id="mute">Sound: on (M)</button>
+</div>
 
 <div id="touch">
   <div class="group">
@@ -79,9 +85,16 @@ const ROCK_SIZES = {
   1: { radius: 14, points: 100, speed: 100 },
 };
 
+// Screen shake: how far (pixels) and how long (seconds) the world shakes.
+const SHAKE_ROCK = { 3: [7, 0.25], 2: [4, 0.18], 1: [2, 0.12] };
+const SHAKE_DEATH = [14, 0.5];
+
+const MUTED_KEY = 'asteroidsMuted';
+
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
 const isTouchDevice = window.matchMedia('(hover: none) and (pointer: coarse)').matches;
+const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
 // ---------- Game state ----------
 let width = 0, height = 0;
@@ -91,6 +104,7 @@ let score = 0, lives = 0, wave = 0;
 let waveTimer = null;             // counts down to the next wave once all rocks are gone
 let gameOverAt = 0;
 let newHighScore = false;
+let shake = { strength: 0, time: 0, duration: 0 };
 let highScore = loadHighScore();
 
 // ---------- High score (browser local storage) ----------
@@ -132,9 +146,17 @@ const KEY_ACTIONS = {
 
 const onStartScreen = () => state === 'title' || state === 'gameover';
 
+// Browsers only allow sound after the player has pressed a key or tapped.
+window.addEventListener('keydown', unlockAudio);
+window.addEventListener('pointerdown', unlockAudio);
+
 window.addEventListener('keydown', (e) => {
   if ((e.code === 'KeyP' || e.code === 'Escape') && !e.repeat) {
     togglePause();
+    return;
+  }
+  if (e.code === 'KeyM' && !e.repeat) {
+    toggleMute();
     return;
   }
   if (onStartScreen() && (e.code === 'Enter' || e.code === 'Space')) {
@@ -169,6 +191,12 @@ const pauseButton = document.getElementById('pause');
 pauseButton.addEventListener('click', () => {
   togglePause();
   pauseButton.blur();             // so Space fires instead of pressing this button again
+});
+
+const muteButton = document.getElementById('mute');
+muteButton.addEventListener('click', () => {
+  toggleMute();
+  muteButton.blur();
 });
 
 // Each button tracks its own finger, so several can be held at once.
@@ -259,6 +287,7 @@ function makeRock(size, x, y) {
 function hitRock(rock) {
   score += ROCK_SIZES[rock.size].points;
   explode(rock.x, rock.y, 8);
+  startShake(...SHAKE_ROCK[rock.size]);
   rocks.splice(rocks.indexOf(rock), 1);
   if (rock.size > 1) {
     rocks.push(makeRock(rock.size - 1, rock.x, rock.y));
@@ -268,6 +297,8 @@ function hitRock(rock) {
 
 function loseLife() {
   explode(ship.x, ship.y, 20);
+  startShake(...SHAKE_DEATH);
+  sounds.death();
   lives--;
   if (lives <= 0) {
     state = 'gameover';
@@ -289,6 +320,17 @@ function explode(x, y, count) {
       life: 0.4 + Math.random() * 0.4,
     });
   }
+}
+
+// A new shake only replaces the current one if it is stronger.
+function startShake(strength, duration) {
+  if (reduceMotion || strength < currentShakeOffset()) return;
+  shake = { strength, time: duration, duration };
+}
+
+// Shake distance right now: starts at full strength and fades to zero.
+function currentShakeOffset() {
+  return shake.time > 0 ? shake.strength * (shake.time / shake.duration) : 0;
 }
 
 // ---------- Update ----------
@@ -315,6 +357,7 @@ function update(dt) {
     p.life -= dt;
   }
   particles = particles.filter((p) => p.life > 0);
+  shake.time = Math.max(0, shake.time - dt);
 
   if (state !== 'playing') return;
 
@@ -372,6 +415,7 @@ function fireBullet() {
     vy: ship.vy + dy * BULLET_SPEED,
     life: BULLET_LIFE,
   });
+  sounds.shoot();
 }
 
 function updateBullets(dt) {
@@ -405,6 +449,12 @@ function draw() {
   ctx.strokeStyle = '#fff';
   ctx.fillStyle = '#fff';
   ctx.lineWidth = 1.5;
+  const inGame = state === 'playing' || state === 'paused';
+
+  // The world (rocks, bullets, particles, ship) shakes; the text drawn after it doesn't.
+  ctx.save();
+  const offset = currentShakeOffset();
+  ctx.translate((Math.random() * 2 - 1) * offset, (Math.random() * 2 - 1) * offset);
 
   rocks.forEach(drawRock);
   for (const b of bullets) ctx.fillRect(b.x - 1.5, b.y - 1.5, 3, 3);
@@ -414,10 +464,14 @@ function draw() {
   }
   ctx.globalAlpha = 1;
 
-  if (state === 'playing' || state === 'paused') {
+  if (inGame) {
     // Blink while the ship can't be hit.
     const visible = ship.safeTime === 0 || Math.floor(ship.safeTime * 8) % 2 === 0;
     if (visible) drawShip(ship.x, ship.y, ship.angle, state === 'playing' && input.thrust);
+  }
+  ctx.restore();
+
+  if (inGame) {
     drawHud();
     if (waveTimer !== null) centerText(`WAVE ${wave + 1}`, height / 2 - 60, 28);
     if (state === 'paused') drawPausedScreen();
@@ -480,7 +534,15 @@ function drawHud() {
 
   if (!isTouchDevice) {
     ctx.fillStyle = '#888';
-    centerText('← → / A D rotate   ↑ / W thrust   Space fire', height - 28, 14);
+    const hint = '← → / A D rotate   ↑ / W thrust   Space fire   P pause   M mute';
+    ctx.font = '14px ui-monospace, Menlo, Consolas, monospace';
+    if (ctx.measureText(hint).width < width - 32) {
+      centerText(hint, height - 28, 14);
+    } else {
+      // Narrow window: split the hint over two lines.
+      centerText('← → / A D rotate   ↑ / W thrust   Space fire', height - 46, 14);
+      centerText('P pause   M mute', height - 26, 14);
+    }
     ctx.fillStyle = '#fff';
   }
 }
@@ -517,6 +579,7 @@ function controlInstructions(y) {
     centerText('← → or A D   rotate', y, 15);
     centerText('↑ or W       thrust', y + 22, 15);
     centerText('Space        fire  ', y + 44, 15);
+    centerText('P pause      M mute', y + 66, 15);
   }
   ctx.fillStyle = '#fff';
 }
@@ -528,6 +591,86 @@ function centerText(text, y, size) {
   ctx.fillText(text, width / 2, y);
 }
 
+// ---------- Sound (generated with the Web Audio API; no sound files) ----------
+let audio = null;                 // created on the first key press or tap
+let masterGain, noiseBuffer, thrustGain;
+let muted = localStorage.getItem(MUTED_KEY) === 'true';
+
+function unlockAudio() {
+  if (!audio) {
+    audio = new AudioContext();
+    masterGain = audio.createGain();
+    masterGain.gain.value = muted ? 0 : 0.5;
+    masterGain.connect(audio.destination);
+
+    // One second of random noise, reused for the death boom and thrust.
+    noiseBuffer = audio.createBuffer(1, audio.sampleRate, audio.sampleRate);
+    const data = noiseBuffer.getChannelData(0);
+    for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+
+    // Thrust: a looping low rumble whose volume is set every frame.
+    const rumble = audio.createBufferSource();
+    rumble.buffer = noiseBuffer;
+    rumble.loop = true;
+    const filter = audio.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.value = 400;
+    thrustGain = audio.createGain();
+    thrustGain.gain.value = 0;
+    rumble.connect(filter).connect(thrustGain).connect(masterGain);
+    rumble.start();
+  }
+  if (audio.state === 'suspended') audio.resume();
+}
+
+function toggleMute() {
+  muted = !muted;
+  localStorage.setItem(MUTED_KEY, String(muted));
+  if (masterGain) masterGain.gain.value = muted ? 0 : 0.5;
+}
+
+// A beep whose pitch slides from startFreq to endFreq and fades out.
+function tone(type, startFreq, endFreq, duration, volume) {
+  if (!audio) return;
+  const t = audio.currentTime;
+  const osc = audio.createOscillator();
+  osc.type = type;
+  osc.frequency.setValueAtTime(startFreq, t);
+  osc.frequency.exponentialRampToValueAtTime(endFreq, t + duration);
+  const gain = audio.createGain();
+  gain.gain.setValueAtTime(volume, t);
+  gain.gain.exponentialRampToValueAtTime(0.001, t + duration);
+  osc.connect(gain).connect(masterGain);
+  osc.start(t);
+  osc.stop(t + duration);
+}
+
+// A burst of noise; a lower cutoff sounds deeper.
+function noise(cutoff, duration, volume) {
+  if (!audio) return;
+  const t = audio.currentTime;
+  const source = audio.createBufferSource();
+  source.buffer = noiseBuffer;
+  const filter = audio.createBiquadFilter();
+  filter.type = 'lowpass';
+  filter.frequency.setValueAtTime(cutoff, t);
+  filter.frequency.exponentialRampToValueAtTime(cutoff * 0.2, t + duration);
+  const gain = audio.createGain();
+  gain.gain.setValueAtTime(volume, t);
+  gain.gain.exponentialRampToValueAtTime(0.001, t + duration);
+  source.connect(filter).connect(gain).connect(masterGain);
+  source.start(t);
+  source.stop(t + duration);
+}
+
+const sounds = {
+  shoot: () => tone('square', 700, 150, 0.25, 0.08),
+  death: () => {
+    noise(900, 0.9, 0.7);
+    tone('sawtooth', 160, 30, 0.9, 0.15);
+  },
+};
+
 // ---------- Main loop ----------
 let lastTime = performance.now();
 function frame(now) {
@@ -537,6 +680,11 @@ function frame(now) {
   draw();
   pauseButton.hidden = onStartScreen();
   pauseButton.textContent = state === 'paused' ? 'Resume (P)' : 'Pause (P)';
+  muteButton.textContent = muted ? 'Sound: off (M)' : 'Sound: on (M)';
+  if (thrustGain) {
+    const thrusting = state === 'playing' && input.thrust;
+    thrustGain.gain.setTargetAtTime(thrusting ? 0.25 : 0, audio.currentTime, 0.05);
+  }
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
